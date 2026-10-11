@@ -1,0 +1,33 @@
+[project]
+name = "scute"
+version = "0.1.0"
+description = "Serve LoRA, DoRA, (IA)^3, VeRA and OFT adapters exactly, in one vLLM batch"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "vllm==0.19.1",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "peft==0.20.0"]
+
+[project.scripts]
+scute-compile = "scute.compile:main"
+scute-serve = "scute.serve:main"
+
+[project.entry-points."vllm.general_plugins"]
+scute = "scute.plugin:register"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not engine'"
+markers = ["engine: starts a vLLM engine on a small model (slow, needs a GPU)"]

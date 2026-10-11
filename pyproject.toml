@@ -3,6 +3,7 @@ name = "scute"
 version = "0.1.0"
 description = "Serve LoRA, DoRA, (IA)^3, VeRA and OFT adapters exactly, in one vLLM batch"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "vllm==0.19.1",

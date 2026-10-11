@@ -169,3 +169,8 @@ tests/
 ```
 
 `scute.vllm_integration.applied_patches()` lists every vLLM symbol that is patched.
+
+## License
+
+Apache License 2.0 (`LICENSE`). Two kernels are modified versions of vLLM's LoRA
+kernels, which are also Apache-2.0; `NOTICE` lists them.

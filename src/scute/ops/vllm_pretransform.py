@@ -1,6 +1,6 @@
 """OFT's input-side slot ``R`` inside vLLM: ``x <- x R_a`` per token, before the base GEMM.
 
-The same pass as :mod:`scute.ops.pretransform`, indexed by vLLM's own token-to-adapter
+The block-diagonal transform of OFT, indexed by vLLM's own token-to-adapter
 metadata (``token_indices_sorted_by_lora_ids``, ``num_tokens_per_lora``,
 ``lora_token_start_loc``, ``lora_ids``) exactly as vLLM's ``lora_expand`` is, so it is
 safe under CUDA graphs: the grid and the tables are fixed buffers.

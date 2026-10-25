@@ -78,24 +78,19 @@ def shared_term(layer, y: torch.Tensor, x: torch.Tensor) -> None:
         off += out
 
 
+import os as _os
+
 #: ``SCUTE_SHARED_IMPL`` picks how the shared-factor term runs:
 #:
-#: ``torch`` (default): dense GEMMs over every row of the batch.  ``A`` and ``B`` are read
-#:   once per step, so the cost is flat in the number of tenants (36.1 -> 38.1 ms TPOT
-#:   from 1 to 16 VeRA tenants, decode burst).  Rows without the term multiply by
-#:   ``d = 0``: wasted FLOPs on non-VeRA rows of a prefill, not wasted bytes.
-#: ``fused``: two kernels over the tenant segments only.  Each segment re-reads the
-#:   factors and the shrink under-fills the card at decode (44.6 ms at one tenant).
-#: ``hybrid``: dense shrink, segmented expand.  The expand re-reads ``B`` per segment,
-#:   which no longer fits in L2 (48.9 ms at 16 tenants).
-#: ``auto`` (default): ``torch`` below ``SCUTE_SHARED_SEG_ROWS`` rows (256), ``hybrid``
-#:   above, decided inside one opaque op.  At prefill the dense form's gathered
-#:   ``e[idx]`` is an ``[N, d_out]`` tensor, the index route of the byte model, while the
-#:   segments are long enough to amortise the expand's read of ``B``.
-import os as _os
 #: ``dense`` (default): ``x A^T`` by cuBLAS, then one Triton expand per slice that is
 #:   dense over row tiles (``B`` read once per row tile), gathers ``d`` and ``e`` per
-#:   row, and loads and stores only rows whose adapter has the term.
+#:   row, and loads and stores only rows whose adapter has the term.  The factors are
+#:   read once per step, whatever the number of tenants.
+#: ``torch``: the same dense form in PyTorch, over every row of the batch.
+#: ``fused``: two kernels over the tenant segments only; each segment reads the factors.
+#: ``hybrid``: a dense shrink, then an expand over the tenant segments.
+#: ``auto``: the dense form below ``SCUTE_SHARED_SEG_ROWS`` rows (256) and the segmented
+#:   expand above, decided inside one opaque op.
 _SHARED_IMPL = _os.environ.get("SCUTE_SHARED_IMPL", "dense")
 
 
@@ -130,7 +125,7 @@ def shared_term_dense(layer, y: torch.Tensor, x: torch.Tensor) -> None:
 
 
 def shared_term_auto(layer, y: torch.Tensor, x: torch.Tensor) -> None:
-    """The default: one opaque op that runs the dense form for small batches and the
+    """One opaque op that runs the dense form for small batches and the
     segmented expand for large ones (:func:`scute.ops.vllm_shared._shared_term`)."""
     from scute.ops.vllm_shared import shared_term_op
 

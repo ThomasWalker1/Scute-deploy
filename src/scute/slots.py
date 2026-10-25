@@ -105,8 +105,8 @@ def compose_specs(inner: AdapterSpec, outer: AdapterSpec, share_factors: bool = 
 
     The inner member's terms acquire an outer diagonal when the outer member scales
     the output.  ``share_factors`` models a stack that reuses the inner adapter's ``B``
-    rather than copying it, so that ``B`` is no longer owned by
-    one live configuration.
+    rather than copying it; ``B`` is then shared, and the new outer diagonal stays
+    live.
     """
     if inner.r or outer.r:
         raise ValueError("closure is stated for R = I; compose pre-transforms separately")

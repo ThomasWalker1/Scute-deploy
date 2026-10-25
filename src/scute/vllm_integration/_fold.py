@@ -19,17 +19,14 @@ over ``W + scaling*BA`` as PEFT defines it, with no second application.
 **Tensor parallelism.**  A column-parallel shard splits ``d_out``, so the norm is
 local and only the magnitude has to be sliced to match.  A row-parallel shard splits
 ``d_in``, so each shard holds a *partial* sum of each squared row norm: the reduction
-must happen over the squares, before the square root.  Getting that order wrong
-produces shards that disagree, and it is the failure that has kept DoRA out of these
-engines.
+must happen over the squares, before the square root.  In the other order, the
+shards disagree.
 
 **Precision, and why the engine must not run in bfloat16.**  The norm is accumulated
 in float32 and ``g`` is stored in the model's compute dtype, which is what a deployed
 engine does and what the expand then reads.  That storage dtype is not a free
-choice.  A trained ``g`` sits very close to 1 -- on the Llama-3.1-8B fine-tunes used
-here it spans about ``[0.98, 1.02]``, which is the same near-identity the checkpoint
-audit reports -- and bfloat16 has only 8 mantissa bits, so it resolves that whole
-range into **9 distinct values**, a relative error of $3.9\\times 10^{-3}$ against a
+choice.  A trained ``g`` sits very close to 1, typically within ``[0.98, 1.02]``,
+and bfloat16 has only 8 mantissa bits, so it resolves that whole range into **9 distinct values**, a relative error of $3.9\\times 10^{-3}$ against a
 signal of $\\pm 2\\%$.  Roughly a fifth of the adaptation would be quantisation.
 float16 gives 62 levels over the same range and float32 is exact for this purpose.
 
@@ -347,7 +344,7 @@ def fold_into_module(
 
     Args:
         fold_e_into_b: multiply this adapter's ``B`` by ``g`` in place.  Required by
-            by the patched expand, which computes ``h \\odot s + VB`` and therefore
+            the patched expand, which computes ``h \\odot s + VB`` and therefore
             relies on ``B`` already carrying ``e``.
 
     Returns True if a magnitude was found and folded.
@@ -390,21 +387,13 @@ def fold_into_module(
             )
             pool[index, row_off: row_off + out_rows] = g.to(pool.dtype)
             if _FOLD_LOG:
-                # Under tensor parallelism a wrong magnitude shard still produces
-                # fluent text, and g sits within 2% of unity so greedy decoding
-                # rarely flips on it either. A per-shard checksum is the evidence
-                # that the fold ran on the right block; token agreement is not.
+                # A per-shard checksum shows that the fold ran on the right block of
+                # the magnitude under tensor parallelism.  Records are keyed by the
+                # adapter id, because slot indices change from run to run.
                 import json as _json
-                # Identity is the adapter id, never the slot. Slot indices are
-                # assigned per run, so joining two degrees on the slot compares
-                # different adapters and the spread of ``g`` across the pool
-                # shows up as a fake sharding error.
                 _name = getattr(module, "_scute_name", "?")
                 _ident = f"lora{lora_id}" if lora_id is not None else f"slot{index}"
                 if _FOLD_VEC:
-                    # Summary statistics cannot separate "one bad row" from
-                    # "everything slightly off", which are different bugs. The full
-                    # vector can.
                     import os as _os
                     _d = f"{_FOLD_LOG}.vec"
                     _os.makedirs(_d, exist_ok=True)

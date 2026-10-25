@@ -86,7 +86,7 @@ def test_s_folds_only_into_a_full_rank_term(d_in, d_out):
     rank = int(torch.linalg.matrix_rank((W * (s - 1)).double()))
     assert rank == min(d_in, d_out)
     # A rank-16 term cannot get close: the best rank-16 approximation leaves most of it
-    # (87-97% on these shapes; bench/fold_rank.py measures it on the real weights).
+    # (87-97% on these shapes).
     sv = torch.linalg.svdvals((W * (s - 1)).double())
     left = float(sv[16:].pow(2).sum() / sv.pow(2).sum())
     assert left > 0.5

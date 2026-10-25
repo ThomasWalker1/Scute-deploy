@@ -262,8 +262,8 @@ def _shared_expand_kernel(
     for k0 in range(0, R, BLOCK_K):
         kk = k0 + ks
         k_ok = kk < R
-        # A per-row gather inside the K loop (all rows naming one adapter) ran 4x slower
-        # than the same work spread over 16 adapters; d is applied before the kernel.
+        # d is applied before this kernel: a per-row gather of d inside the K loop is
+        # slow when many rows name the same adapter.
         vt = tl.load(v_ptr + rows[:, None] * stride_v + kk[None, :],
                      mask=r_ok[:, None] & k_ok[None, :], other=0.0)
         bt = tl.load(b_ptr + cols[None, :] * stride_b + kk[:, None],

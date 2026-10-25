@@ -5,8 +5,7 @@ Three things in the loader assume an adapter tensor is either ``lora_A`` or
 
 ``parse_fine_tuned_lora_name`` recognises ``lora_A``, ``lora_B`` and the two
 embedding names, and **raises** on anything else.  A DoRA checkpoint carries one
-``lora_magnitude_vector`` per adapted module -- 160 of them in the Llama-3.1-8B
-fine-tunes used here -- so every one of them hits that raise.
+``lora_magnitude_vector`` per adapted module, so every one of them hits that raise.
 
 ``LoRAModel.from_lora_tensors`` branches on a single ``is_lora_a`` boolean, so there
 is no third place for the magnitude to go.
@@ -24,8 +23,7 @@ the parser to stop raising.
 **The name is bound at import time.**  ``vllm.lora.lora_model`` does
 ``from vllm.lora.utils import parse_fine_tuned_lora_name``, so patching
 ``vllm.lora.utils`` alone leaves the loader calling the original.  Both bindings are
-replaced below; this is the failure mode most likely to look like the patch simply
-having no effect.
+replaced below.
 """
 
 from __future__ import annotations
@@ -141,9 +139,8 @@ def _pack(cls, loras):
     """vLLM's ``PackedLoRALayerWeights.pack``, carrying the magnitude list along.
 
     The list is positional and keeps ``None`` for an unadapted sub-module, because
-    the packed layer's output slices are positional too.  Our Llama-3.1-8B pool
-    adapts ``up_proj`` but not ``gate_proj``, so that ``None`` is a case the fold
-    actually meets rather than a defensive placeholder.
+    the packed layer's output slices are positional too.  An adapter of ``up_proj``
+    without ``gate_proj`` has such a ``None``.
     """
     first_lora = next(lora for lora in loras if lora is not None)
     for lora in loras:

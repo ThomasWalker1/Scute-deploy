@@ -6,8 +6,8 @@ embedding adapters, or the fully-sharded LoRA variants.
 
 A silently wrong number is the failure mode that matters here.  Every uncovered path
 below would otherwise run and produce plausible tokens with the magnitude applied to
-the wrong tensor, or not applied at all.  So each one raises at setup, where it is attributable, rather than at a
-number nobody can trace.
+the wrong tensor, or not applied at all.  So each one raises at setup, where it is
+attributable, rather than at a number nobody can trace.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def check_config(lora_config, model_config=None) -> None:
 def check_dtype(dtype) -> None:
     """Refuse bfloat16, which cannot represent a trained DoRA magnitude.
 
-    ``g`` sits within about 1% of unity, and bfloat16's 8 mantissa bits resolve that
+    ``g`` sits within about 2% of unity, and bfloat16's 8 mantissa bits resolve that
     band into 9 distinct values -- a 3.9e-3 relative error against a 2% signal. The
     adapter would still serve, and about a fifth of its effect would be quantisation
     noise.

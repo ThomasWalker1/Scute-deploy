@@ -34,8 +34,7 @@ def expand_with_slot(layer, output: torch.Tensor, x: torch.Tensor) -> torch.Tens
     buffer = torch.empty(
         (len(layer.output_slices), x2.size(0), rank), dtype=torch.float32, device=x2.device
     )
-    mask = (getattr(layer, "_scute_main_mask", None)
-            if _os.environ.get("SCUTE_MAIN_MASK", "1") == "1" else None)
+    mask = getattr(layer, "_scute_main_mask", None)
     if mask is None:
         wrapper.add_shrink(buffer, x2, layer.lora_a_stacked, 1.0)
     else:
@@ -62,59 +61,12 @@ def expand_with_slot(layer, output: torch.Tensor, x: torch.Tensor) -> torch.Tens
 def shared_term(layer, y: torch.Tensor, x: torch.Tensor) -> None:
     """Add ``((x A) ⊙ d) B ⊙ e`` for terms whose factors every adapter shares (VeRA).
 
-    ``A`` and ``B`` are the same for every adapter of the key, so ``xA`` is one dense
-    GEMM over the whole batch and each slice's ``B`` is one more: the factors are read
-    once per step however many adapters use them.  ``d`` and ``e`` are gathered per
-    token; their default rows (zero ``d``) make the term vanish for every other token.
+    ``x A^T`` is one cuBLAS GEMM over the batch, and one Triton expand covers every
+    slice: it is dense over row tiles, so it reads each tile of ``B`` once for all rows,
+    whatever their adapters.  The factors are therefore read once per step, however many
+    adapters use them.  ``d`` and ``e`` are gathered per row, and rows whose adapter has
+    no such term are neither loaded nor stored.
     """
-    idx = layer.punica_wrapper._token_lora_indices[: x.shape[0]]
-    v = x @ layer._scute_shared_A.t()
-    d = layer._scute_d_pool[idx]
-    e = layer._scute_e_pool[idx]
-    off = 0
-    for i, out in enumerate(layer.output_slices):
-        b = getattr(layer, f"_scute_shared_B{i}")
-        y[:, off: off + out] += ((v * d[:, i]) @ b.t()) * e[:, off: off + out]
-        off += out
-
-
-import os as _os
-
-#: ``SCUTE_SHARED_IMPL`` picks how the shared-factor term runs:
-#:
-#: ``dense`` (default): ``x A^T`` by cuBLAS, then one Triton expand per slice that is
-#:   dense over row tiles (``B`` read once per row tile), gathers ``d`` and ``e`` per
-#:   row, and loads and stores only rows whose adapter has the term.  The factors are
-#:   read once per step, whatever the number of tenants.
-#: ``torch``: the same dense form in PyTorch, over every row of the batch.
-#: ``fused``: two kernels over the tenant segments only; each segment reads the factors.
-#: ``hybrid``: a dense shrink, then an expand over the tenant segments.
-#: ``auto``: the dense form below ``SCUTE_SHARED_SEG_ROWS`` rows (256) and the segmented
-#:   expand above, decided inside one opaque op.
-_SHARED_IMPL = _os.environ.get("SCUTE_SHARED_IMPL", "dense")
-
-
-def shared_term_fused(layer, y: torch.Tensor, x: torch.Tensor) -> None:
-    """``((x A) ⊙ d) B ⊙ e`` in two launches over the tokens whose adapter has the term."""
-    from scute.ops.vllm_expand_s import lora_expand_s
-    from scute.ops.vllm_shared import vllm_shared_shrink
-
-    wrapper = layer.punica_wrapper
-    meta = wrapper.token_mapping_meta.meta_args(
-        x.size(0), wrapper.lora_config.specialize_active_lora)
-    r = layer._scute_shared_A.shape[0]
-    buf = torch.empty((len(layer.output_slices), x.size(0), r), dtype=torch.float32,
-                      device=x.device)
-    vllm_shared_shrink(buf, x, layer._scute_shared_A, layer._scute_d_pool,
-                       layer._scute_shared_mask, *meta)
-    lora_expand_s(buf, layer._scute_shared_Bx, y, None, *meta, offset_start=0,
-                  add_inputs=True, e_pool=layer._scute_e_pool,
-                  slot_mask=layer._scute_shared_mask)
-
-
-def shared_term_dense(layer, y: torch.Tensor, x: torch.Tensor) -> None:
-    """The default: ``x A^T`` once, then one dense-over-rows expand per slice that reads
-    each tile of ``B`` once for all rows and touches only rows that have the term."""
     from scute.ops.vllm_shared import shared_dense_op
 
     idx = layer.punica_wrapper._token_lora_indices[: x.size(0)]
@@ -122,37 +74,6 @@ def shared_term_dense(layer, y: torch.Tensor, x: torch.Tensor) -> None:
     shared_dense_op(y, x, layer._scute_shared_A, b_list, layer._scute_d_pool,
                     layer._scute_e_pool, layer._scute_shared_mask, idx,
                     layer.punica_wrapper._scute_flags)
-
-
-def shared_term_auto(layer, y: torch.Tensor, x: torch.Tensor) -> None:
-    """One opaque op that runs the dense form for small batches and the
-    segmented expand for large ones (:func:`scute.ops.vllm_shared._shared_term`)."""
-    from scute.ops.vllm_shared import shared_term_op
-
-    wrapper = layer.punica_wrapper
-    meta = wrapper.token_mapping_meta.meta_args(
-        x.size(0), wrapper.lora_config.specialize_active_lora)
-    idx = wrapper._token_lora_indices[: x.size(0)]
-    b_list = [getattr(layer, f"_scute_shared_B{i}") for i in range(len(layer.output_slices))]
-    shared_term_op(y, x, layer._scute_shared_A, b_list, layer._scute_shared_Bx,
-                   layer._scute_d_pool, layer._scute_e_pool, layer._scute_shared_mask, idx,
-                   *meta)
-
-
-def shared_term_hybrid(layer, y: torch.Tensor, x: torch.Tensor) -> None:
-    """Dense shrink over every row (cuBLAS reads ``A`` once per step), then the masked
-    expand with ``e`` over the rows whose adapter has the term."""
-    from scute.ops.vllm_expand_s import lora_expand_s
-
-    wrapper = layer.punica_wrapper
-    meta = wrapper.token_mapping_meta.meta_args(
-        x.size(0), wrapper.lora_config.specialize_active_lora)
-    idx = wrapper._token_lora_indices[: x.size(0)]
-    v = (x @ layer._scute_shared_A.t()).float()
-    buf = (v.unsqueeze(0) * layer._scute_d_pool[idx].transpose(0, 1).float()).contiguous()
-    lora_expand_s(buf, layer._scute_shared_Bx, y, None, *meta, offset_start=0,
-                  add_inputs=True, e_pool=layer._scute_e_pool,
-                  slot_mask=layer._scute_shared_mask)
 
 
 def oft_base(layer, x: torch.Tensor, bias) -> torch.Tensor:
@@ -182,7 +103,7 @@ def apply() -> None:
 
     from scute.ops.vllm_expand_s import _register
     from scute.ops.vllm_pretransform import _register as _register_pre
-    from scute.ops.vllm_shared import _register as _register_shared
+    from scute.ops.vllm_shared import _register_dense
 
     # Register the ops before vLLM traces anything, so the trace sees opaque ops.
     _register()
@@ -191,9 +112,6 @@ def apply() -> None:
     _register_base()
     from scute.ops.vllm_shrink_m import _register as _register_shrink
     _register_shrink()
-    _register_shared()
-    from scute.ops.vllm_shared import _register_dense, _register_term
-    _register_term()
     _register_dense()
 
     def _apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -208,10 +126,7 @@ def apply() -> None:
             x = x.flatten(0, 1)
         output = expand_with_slot(self, output, x)
         if hasattr(self, "_scute_d_pool"):
-            {"fused": shared_term_fused, "hybrid": shared_term_hybrid,
-             "torch": shared_term, "auto": shared_term_auto}.get(
-                _SHARED_IMPL, shared_term_dense)(
-                self, output.view(-1, output.shape[-1]), x.view(-1, x.shape[-1]))
+            shared_term(self, output.view(-1, output.shape[-1]), x.view(-1, x.shape[-1]))
         if original_shape is not None:
             output = output.reshape(original_shape)
         return output

@@ -13,7 +13,8 @@ uses for ``B``.  Nothing else differs from the shipped kernel: the grid, the til
 the configs from ``get_lora_op_configs``, the pointer tables, and the metadata.  So
 the cost this kernel adds over vLLM's is the cost of the slot and of nothing else.
 
-With ``USE_S=False`` the kernel is the shipped one, line for line.
+A per-slot mask (``USE_MASK``) lets the expand skip adapters that have no term on the
+layer.  With ``USE_S`` and ``USE_MASK`` off, the kernel is the shipped one, line for line.
 ``tests/test_vllm_expand_s.py`` checks that, and checks ``s`` against the reference
 expand.
 """
@@ -38,8 +39,6 @@ def _do_expand_s(
     out_ptr,
     s_ptr,
     s_d0_stride,
-    e_ptr,
-    e_d0_stride,
     N,
     K,
     M_LEN,
@@ -62,7 +61,6 @@ def _do_expand_s(
     CAST_TYPE: tl.constexpr,
     ADD_INPUTS: tl.constexpr,
     USE_S: tl.constexpr,
-    USE_E: tl.constexpr,
 ):
     if SAME_STRIDE:
         cur_lora_d0_stride = ls_d0_ptr
@@ -117,13 +115,6 @@ def _do_expand_s(
     )
     c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :] < (cur_slice_start + N))
 
-    if USE_E:
-        # The outer diagonal of a term whose B is shared (VeRA): it scales the term,
-        # and cannot fold into B because B belongs to every adapter.
-        e_mask = offset_cn < (cur_slice_start + N)
-        e_tile = tl.load(e_ptr + lora_index * e_d0_stride + offset_cn, mask=e_mask,
-                         other=1.0)
-        tiled_c = tiled_c * e_tile[None, :]
     if ADD_INPUTS:
         tiled_out = tl.load(c_ptr, mask=c_mask)
         if USE_S:
@@ -146,8 +137,6 @@ def _lora_expand_s_kernel(
     out_ptr,
     s_ptr,
     s_d0_stride,
-    e_ptr,
-    e_d0_stride,
     slot_mask_ptr,
     M,
     N,
@@ -175,7 +164,6 @@ def _lora_expand_s_kernel(
     SLICE_NUM: tl.constexpr,
     SAME_STRIDE: tl.constexpr,
     USE_S: tl.constexpr,
-    USE_E: tl.constexpr,
     USE_MASK: tl.constexpr,
 ):
     cta_n_num = tl.cdiv(N, BLOCK_N)
@@ -190,7 +178,7 @@ def _lora_expand_s_kernel(
     if lora_id == -1:
         return
     if USE_MASK:
-        # Only the slots whose adapter has this term (a shared-factor pass skips the rest).
+        # Only the slots whose adapter has a term or an s on this layer.
         if tl.load(slot_mask_ptr + lora_id) == 0:
             return
     lora_m_size = tl.load(num_tokens_per_lora + lora_idx)
@@ -210,56 +198,13 @@ def _lora_expand_s_kernel(
 
     _do_expand_s(
         pid_n, lora_id, slice_id, input_ptr, lora_ptr, out_ptr, s_ptr, s_d0_stride,
-        e_ptr, e_d0_stride, curr_N, K, cta_m_len, ram, slice_start_loc,
+        curr_N, K, cta_m_len, ram, slice_start_loc,
         input_d0_stride, input_d1_stride, input_d2_stride,
         ls_d0_ptr, ls_d1_ptr, ls_d2_ptr,
         output_d0_stride, output_d1_stride,
         BLOCK_M, BLOCK_N, BLOCK_K, SAME_STRIDE, SLICE_NUM, EVEN_K, CAST_TYPE,
-        ADD_INPUTS, USE_S, USE_E,
+        ADD_INPUTS, USE_S,
     )
-
-
-_B_PTR: dict = {}
-
-
-def _b_ptr_table(lora_weights: list[torch.Tensor], offset_start: int, device):
-    """vLLM's ``_get_lora_b_ptr``, allowing a slot stride of 0.
-
-    A shared ``B`` (VeRA) is one tensor read by every slot, passed as a view expanded
-    over the slot dimension.  vLLM's builder asserts contiguity, which such a view is not;
-    everything else here is its logic.  The cache key includes sizes and strides,
-    because shared views of different layers start at the same address.
-    """
-    key = tuple((w.data_ptr(), tuple(w.shape), tuple(w.stride())) for w in lora_weights)
-    if key in _B_PTR:
-        return _B_PTR[key]
-    starts, ptrs, d0, d1, d2, sizes = [], [], [], [], [], []
-    off = offset_start
-    for w in lora_weights:
-        if w.ndim == 4:
-            assert w.size(1) == 1
-            w = w.squeeze(1)
-        assert w.ndim == 3 and w.stride(2) == 1
-        ptrs.append(w.data_ptr())
-        d0.append(w.stride(0))
-        d1.append(w.stride(1))
-        d2.append(w.stride(2))
-        starts.append(off)
-        off += w.size(1)
-        sizes.append(w.size(1))
-    if len(lora_weights) > 1:
-        ptr_t = torch.tensor(ptrs, device=device, dtype=torch.uint64)
-        start_t = torch.tensor(starts, device=device, dtype=torch.uint64)
-    else:
-        start_t, ptr_t = starts[0], w[0]
-    if len(set(d0)) == 1 and len(set(d1)) == 1 and len(set(d2)) == 1 and len(set(sizes)) == 1:
-        vals = (start_t, ptr_t, d0[0], d1[0], d2[0], sizes[0], True, max(sizes))
-    else:
-        vals = (start_t, ptr_t, torch.tensor(d0, device=device), torch.tensor(d1, device=device),
-                torch.tensor(d2, device=device), torch.tensor(sizes, device=device), False,
-                max(sizes))
-    _B_PTR[key] = vals
-    return vals
 
 
 @torch.inference_mode()
@@ -277,11 +222,10 @@ def _lora_expand_s(
     num_active_loras: torch.Tensor,
     offset_start: int = 0,
     add_inputs: bool = False,
-    e_pool: Optional[torch.Tensor] = None,
     slot_mask: Optional[torch.Tensor] = None,
 ) -> None:
-    """vLLM's ``_lora_expand`` with the ``s`` pool (or ``None``), and optionally the outer
-    diagonal ``e`` and a per-slot mask of the slots to visit."""
+    """vLLM's ``_lora_expand`` with the ``s`` pool (or ``None``), and optionally a
+    per-slot mask of the slots to visit."""
     from vllm.lora.ops.triton_ops.utils import _get_lora_b_ptr, get_lora_op_configs
 
     assert no_lora_flag_cpu.numel() == 1
@@ -305,8 +249,7 @@ def _lora_expand_s(
         hidden_sizes_tensor,
         same_stride,
         MAX_N,
-    ) = (_b_ptr_table(lora_b_weights, offset_start, inputs.device) if slot_mask is not None
-         else _get_lora_b_ptr(lora_b_weights, offset_start, inputs.device))
+    ) = _get_lora_b_ptr(lora_b_weights, offset_start, inputs.device)
 
     K = lora_b_weights[0].shape[-1]
     MAX_LORAS = lora_ids.size(0)
@@ -333,8 +276,6 @@ def _lora_expand_s(
         output_tensor,
         s_pool if use_s else output_tensor,
         s_pool.stride(0) if use_s else 0,
-        e_pool if e_pool is not None else output_tensor,
-        e_pool.stride(0) if e_pool is not None else 0,
         slot_mask if slot_mask is not None else lora_ids,
         M,
         MAX_N,
@@ -362,7 +303,6 @@ def _lora_expand_s(
         NUM_SLICES,
         same_stride,
         use_s,
-        e_pool is not None,
         slot_mask is not None,
         num_warps=kernel_config["num_warps"],
         num_ctas=kernel_config["num_ctas"],
@@ -384,7 +324,6 @@ def _lora_expand_s_fake(
     num_active_loras: torch.Tensor,
     offset_start: int = 0,
     add_inputs: bool = False,
-    e_pool: Optional[torch.Tensor] = None,
     slot_mask: Optional[torch.Tensor] = None,
 ) -> None:
     return None

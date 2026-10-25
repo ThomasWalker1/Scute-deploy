@@ -190,16 +190,10 @@ def _ensure_shared(module, max_loras: int) -> None:
     module.register_buffer("_scute_shared_A",
                            sh["A"][:, rank * d_in:(rank + 1) * d_in] if row
                            else sh["A"][:, :d_in], persistent=False)
-    b_rows = []
     for i, out in enumerate(module.output_slices):
         lo = 0 if (row or module.tp_size == 1) else rank * out
-        b_rows.append(sh["B"][lo: lo + out])
-        module.register_buffer(f"_scute_shared_B{i}", b_rows[-1], persistent=False)
+        module.register_buffer(f"_scute_shared_B{i}", sh["B"][lo: lo + out], persistent=False)
     n = len(module.output_slices)
-    # The same B for every slot: views expanded over the slot dimension (stride 0),
-    # which the expand reads through its per-slice pointer table.
-    module._scute_shared_Bx = [
-        b.view(1, b.shape[0], r).expand(max_loras + 1, b.shape[0], r) for b in b_rows]
     module.register_buffer(
         "_scute_shared_mask", torch.zeros(max_loras + 1, dtype=torch.int32, device=ref.device),
         persistent=False)
